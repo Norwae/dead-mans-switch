@@ -1,69 +1,97 @@
 package deadmod
 
 import (
+	"cloud.google.com/go/datastore"
+	"context"
+	"encoding/json"
 	"fmt"
 	"github.com/satori/go.uuid"
 	"io"
+	"log"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
-type StatusCoder interface {
-	StatusCode() int
+// datastore setup and initialization
+
+var (
+	store   *datastore.Client
+	baseURL string
+)
+
+func init() {
+	// unfortunately, there seems to be no simple env property reporting the unmangled invocations URL, so
+	// we build it from its parts
+
+	projectId := os.Getenv("GCP_PROJECT")
+	region := os.Getenv("FUNCTION_REGION")
+	name := os.Getenv("FUNCTION_NAME")
+
+	baseURL = fmt.Sprint("https://", region, "-", projectId, ".cloudfunctions.net/", name)
+
+	client, err := datastore.NewClient(context.Background(), projectId)
+	if err != nil {
+		log.Fatalf("Could not create datastore client: %v", err)
+	} else {
+		log.Printf("Initialized datastore client for project %s with base url %s", projectId, baseURL)
+		store = client
+	}
 }
 
-type NotFound struct{}
+// http layer
 
-func (n NotFound) StatusCode() int {
-	return http.StatusNotFound
+type StatusCodeError struct {
+	StatusCode int
+	Message    string
 }
 
-func (n NotFound) Error() string {
-	return "The requested resource could not be found"
-}
-
-type MethodNotAllowed []string
-
-func (m MethodNotAllowed) StatusCode() int {
-	return http.StatusMethodNotAllowed
-}
-
-func (m MethodNotAllowed) Error() string {
-	return fmt.Sprintf("Method not allowed. Supported methods: %v", m)
+func (ue *StatusCodeError) Error() string {
+	return ue.Message
 }
 
 func HandleHTTP(rw http.ResponseWriter, rq *http.Request) {
-	var err error = NotFound{}
+	var err error = &StatusCodeError{http.StatusNotFound, fmt.Sprintf("The requested URL \"%s\" could not be found", rq.URL.Path)}
 	segments := strings.Split(rq.URL.Path, "/")
 	length := len(segments)
-	if length >= 1 && segments[0] == "triggers" {
+	log.Printf("Split path into %d segments: %v", length, segments)
+	if length >= 2 && segments[1] == "triggers" {
 		switch length {
-		case 1:
-			if rq.Method == "POST" {
-				err = createTrigger(rq.Body, rw)
-			} else {
-				err = MethodNotAllowed{"POST"}
-			}
 		case 2:
-			if id, e2 := uuid.FromString(segments[1]); e2 != nil {
+			if rq.Method == "POST" {
+				err = createTrigger(rq.Context(), rq.Body, rw)
+			} else {
+				err = &StatusCodeError{http.StatusMethodNotAllowed, "The requested method is not available. Available methods: POST"}
+			}
+		case 3:
+			if id, e2 := uuid.FromString(segments[2]); e2 == nil {
 				switch rq.Method {
 				case "GET":
-					err = getTrigger(id, rw)
+					err = getTrigger(rq.Context(), id, rw)
 				case "DELETE":
-					err = deleteTrigger(id, rw)
+					err = deleteTrigger(rq.Context(), id, rw)
 				default:
-					err = MethodNotAllowed{"GET", "DELETE"}
+
+					err = &StatusCodeError{http.StatusMethodNotAllowed, "The requested method is not available. Available methods: GET, DELETE"}
 				}
-			} // else not found - not a valid UUID
-		case 3:
-			if id, e2 := uuid.FromString(segments[1]); e2 == nil && segments[2] == "checkin" {
+			} else {
+				log.Printf("Could not parse %s into a valid UUID: %s", segments[2], e2)
+
+				// not found - not a valid UUID
+			}
+		case 4:
+			if id, e2 := uuid.FromString(segments[2]); e2 == nil && segments[3] == "checkin" {
 				if rq.Method == "POST" {
-					err = checkinTrigger(id, rw)
+					err = checkinTrigger(rq.Context(), id, rw)
 				} else {
-					err = MethodNotAllowed{"POST"}
+					err = &StatusCodeError{http.StatusMethodNotAllowed, "The requested method is not available. Available methods: POST"}
 				}
-			} // else not found - not a valid UUID
+			} else {
+				log.Printf("Could not parse %s into a valid UUID: %s", segments[2], e2)
+				// not found - not a valid UUID
+			}
 		}
 
 	}
@@ -71,9 +99,10 @@ func HandleHTTP(rw http.ResponseWriter, rq *http.Request) {
 	if err != nil {
 		code := http.StatusInternalServerError
 		text := []byte(err.Error())
-		if sc, ok := err.(StatusCoder); ok {
-			code = sc.StatusCode()
+		if sc, ok := err.(*StatusCodeError); ok {
+			code = sc.StatusCode
 		}
+		log.Printf("Error detected, reporting status %v to user (%v)", code, err)
 
 		rw.Header().Add("Content-Type", "text/plain;charset=UTF-8")
 		rw.Header().Add("Content-Length", strconv.Itoa(len(text)))
@@ -82,22 +111,85 @@ func HandleHTTP(rw http.ResponseWriter, rq *http.Request) {
 	}
 }
 
-func checkinTrigger(uuids uuid.UUID, writer http.ResponseWriter) error {
-	writer.Write([]byte("CheckinTrigger"))
-	return nil
+// business logic for API server
+
+const Kind = "DMT"
+
+type DeadMansTrigger struct {
+	Id               string      `json:id`
+	DueToFire        time.Time   `json:due`
+	HoursBetweenFire int         `json:hoursBetweenFire`
+	Checkins         []time.Time `json:checkins`
+	FireURL          string      `json:fireURL`
+	FirePayload      string      `json:firePayload`
 }
 
-func deleteTrigger(uuids uuid.UUID, writer http.ResponseWriter) error {
-	writer.Write([]byte("DeleteTrigger"))
-	return nil
+func checkinTrigger(ctx context.Context, id uuid.UUID, writer http.ResponseWriter) error {
+	entity := DeadMansTrigger{}
+	key := datastore.Key{Kind: Kind, Name: id.String()}
+	err := store.Get(ctx, &key, &entity)
+
+	if err == nil {
+		now := time.Now()
+		entity.Checkins = append(entity.Checkins, now)
+		entity.DueToFire = now.Add(time.Duration(entity.HoursBetweenFire * int(time.Hour)))
+
+		_, err = store.Put(ctx, &key, &entity)
+	}
+
+	return err
 }
 
-func getTrigger(uuids uuid.UUID, writer http.ResponseWriter) error {
-	writer.Write([]byte("GetTrigger"))
-	return nil
+func deleteTrigger(ctx context.Context, id uuid.UUID, writer http.ResponseWriter) error {
+	log.Printf("Deleting trigger for %v from datastore", id)
+	err := store.Delete(ctx, &datastore.Key{Kind: Kind, Name: id.String()})
+	if err == nil {
+		writer.WriteHeader(http.StatusNoContent)
+	}
+	return err
 }
 
-func createTrigger(body io.ReadCloser, responseWriter http.ResponseWriter) error {
-	responseWriter.Write([]byte("CreateTrigger"))
-	return nil
+func getTrigger(ctx context.Context, id uuid.UUID, writer http.ResponseWriter) error {
+	entity := DeadMansTrigger{}
+	err := store.Get(ctx, &datastore.Key{Kind: Kind, Name: id.String()}, &entity)
+
+	if err == nil {
+		writer.Header().Add("Content-Type", "application/json")
+		json.NewEncoder(writer).Encode(&entity)
+	}
+
+	return err
+}
+
+func createTrigger(ctx context.Context, body io.ReadCloser, responseWriter http.ResponseWriter) error {
+	var input struct {
+		HoursBetweenFire int    `json:hoursBetweenFire`
+		FireURL          string `json:fireURL`
+		FirePayload      string `json:firePayload`
+	}
+
+	err := json.NewDecoder(body).Decode(&input)
+
+	if err == nil {
+		now := time.Now()
+		fullEntity := DeadMansTrigger{
+			Id:               uuid.NewV4().String(),
+			DueToFire:        now.Add(time.Duration(input.HoursBetweenFire * int(time.Hour))),
+			Checkins:         []time.Time{now},
+			HoursBetweenFire: input.HoursBetweenFire,
+			FirePayload:      input.FirePayload,
+			FireURL:          input.FireURL,
+		}
+
+		if _, err = store.Put(ctx, &datastore.Key{Kind: Kind, Name: fullEntity.Id}, &fullEntity); err == nil {
+			path := fmt.Sprint(baseURL, "/triggers/", fullEntity.Id)
+			responseWriter.Header().Add("Location", path)
+			responseWriter.WriteHeader(http.StatusTemporaryRedirect)
+			log.Printf("Inserted entity %s, and redirected user to %s", fullEntity.Id, path)
+		}
+	} else {
+		err = &StatusCodeError{http.StatusUnprocessableEntity, err.Error()}
+	}
+
+	return err
 }
