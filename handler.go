@@ -218,15 +218,11 @@ func ServeCron(ctx context.Context, ignore IgnoredParameter) error {
 		err    error
 		k      *datastore.Key
 		wg     sync.WaitGroup
-		target struct {
-			FireURL     string
-			FirePayload string
-		}
+		target DeadMansTrigger
 	)
 
 	query := datastore.NewQuery(Kind).
-		Filter("DueToFire <= ", time.Now()).
-		Project("FireURL", "FirePayload")
+		Filter("DueToFire <= ", time.Now())
 
 	it := store.Run(ctx, query)
 	for k, err = it.Next(&target); err == nil; k, err = it.Next(&target) {
