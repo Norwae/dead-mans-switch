@@ -215,15 +215,22 @@ type IgnoredParameter struct{}
 
 func ServeCron(ctx context.Context, ignore IgnoredParameter) error {
 	var (
-		err error
-		k   *datastore.Key
-		wg  sync.WaitGroup
+		err    error
+		k      *datastore.Key
+		wg     sync.WaitGroup
+		target struct {
+			FireURL     string
+			FirePayload string
+		}
 	)
-	query := datastore.NewQuery(Kind).Filter("DueToFire <= ", time.Now())
+
+	query := datastore.NewQuery(Kind).
+		Filter("DueToFire <= ", time.Now()).
+		Project("FireURL", "FirePayload")
+
 	it := store.Run(ctx, query)
-	target := DeadMansTrigger{}
 	for k, err = it.Next(&target); err == nil; k, err = it.Next(&target) {
-		log.Printf("Firing %s callback to %s (async)", target.Id, target.FireURL)
+		log.Printf("Firing %s callback to %s (async)", k.Name, target.FireURL)
 		wg.Add(1)
 		go fireHttpCallback(ctx, target.FireURL, target.FirePayload, &wg)
 		err = store.Delete(ctx, k)
