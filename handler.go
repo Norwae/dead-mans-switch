@@ -222,7 +222,7 @@ func ServeCron(ctx context.Context, ignore IgnoredParameter) error {
 	query := datastore.NewQuery(Kind).Filter("DueToFire <= ", time.Now())
 	it := store.Run(ctx, query)
 	target := DeadMansTrigger{}
-	for k, err = it.Next(&target); err == nil; _, err = it.Next(&target) {
+	for k, err = it.Next(&target); err == nil; k, err = it.Next(&target) {
 		log.Printf("Firing %s callback to %s (async)", target.Id, target.FireURL)
 		wg.Add(1)
 		go fireHttpCallback(ctx, target.FireURL, target.FirePayload, &wg)
