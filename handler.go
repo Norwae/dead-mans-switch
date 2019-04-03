@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/satori/go.uuid"
+	"google.golang.org/api/iterator"
 	"io"
 	"log"
 	"net/http"
@@ -112,7 +113,7 @@ func HandleHTTP(rw http.ResponseWriter, rq *http.Request) {
 	}
 }
 
-// business logic for API server
+// service logic
 
 const Kind = "DMT"
 
@@ -131,7 +132,7 @@ func checkinTrigger(ctx context.Context, id uuid.UUID, writer http.ResponseWrite
 	err := store.Get(ctx, &key, &entity)
 
 	if err == nil {
-		now := time.Now()
+		now := time.Now().Truncate(time.Second)
 		entity.Checkins = append(entity.Checkins, now)
 		entity.DueToFire = now.Add(time.Duration(entity.HoursBetweenFire * int(time.Hour)))
 
@@ -162,6 +163,8 @@ func getTrigger(ctx context.Context, id uuid.UUID, writer http.ResponseWriter) e
 
 	if err == nil {
 		sendEntity(writer, &entity)
+	} else if err == datastore.ErrNoSuchEntity {
+		err = &notFound
 	}
 
 	return err
@@ -182,7 +185,7 @@ func createTrigger(ctx context.Context, body io.ReadCloser, responseWriter http.
 	err := json.NewDecoder(body).Decode(&input)
 
 	if err == nil {
-		now := time.Now()
+		now := time.Now().Truncate(time.Second)
 		fullEntity := DeadMansTrigger{
 			Id:               uuid.NewV4().String(),
 			DueToFire:        now.Add(time.Duration(input.HoursBetweenFire * int(time.Hour))),
@@ -200,6 +203,26 @@ func createTrigger(ctx context.Context, body io.ReadCloser, responseWriter http.
 		}
 	} else {
 		err = &StatusCodeError{http.StatusUnprocessableEntity, err.Error()}
+	}
+
+	return err
+}
+
+// cronjob logic
+
+type IgnoredParameter struct{}
+
+func ServeCron(ctx context.Context, ignore IgnoredParameter) error {
+	var err error
+	query := datastore.NewQuery(Kind).Filter("DueToFire <= ", time.Now())
+	it := store.Run(ctx, query)
+	target := DeadMansTrigger{}
+	for _, err = it.Next(&target); err == nil; _, err = it.Next(&target) {
+		log.Printf("Firing %v", target)
+	}
+
+	if err == iterator.Done {
+		err = nil
 	}
 
 	return err
