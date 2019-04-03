@@ -18,8 +18,9 @@ import (
 // datastore setup and initialization
 
 var (
-	store   *datastore.Client
-	baseURL string
+	store    *datastore.Client
+	baseURL  string
+	notFound = StatusCodeError{http.StatusNotFound, "The requested URL could not be found"}
 )
 
 func init() {
@@ -53,7 +54,7 @@ func (ue *StatusCodeError) Error() string {
 }
 
 func HandleHTTP(rw http.ResponseWriter, rq *http.Request) {
-	var err error = &StatusCodeError{http.StatusNotFound, fmt.Sprintf("The requested URL \"%s\" could not be found", rq.URL.Path)}
+	var err error = &notFound
 	segments := strings.Split(rq.URL.Path, "/")
 	length := len(segments)
 	log.Printf("Split path into %d segments: %v", length, segments)
@@ -107,7 +108,7 @@ func HandleHTTP(rw http.ResponseWriter, rq *http.Request) {
 		rw.Header().Add("Content-Type", "text/plain;charset=UTF-8")
 		rw.Header().Add("Content-Length", strconv.Itoa(len(text)))
 		rw.WriteHeader(code)
-		rw.Write(text)
+		_, _ = rw.Write(text)
 	}
 }
 
@@ -116,12 +117,12 @@ func HandleHTTP(rw http.ResponseWriter, rq *http.Request) {
 const Kind = "DMT"
 
 type DeadMansTrigger struct {
-	Id               string      `json:id`
-	DueToFire        time.Time   `json:due`
-	HoursBetweenFire int         `json:hoursBetweenFire`
-	Checkins         []time.Time `json:checkins`
-	FireURL          string      `json:fireURL`
-	FirePayload      string      `json:firePayload`
+	Id               string      `json:"id"`
+	DueToFire        time.Time   `json:"due"`
+	HoursBetweenFire int         `json:"hoursBetweenFire"`
+	Checkins         []time.Time `json:"checkins"`
+	FireURL          string      `json:"fireURL"`
+	FirePayload      string      `json:"firePayload"`
 }
 
 func checkinTrigger(ctx context.Context, id uuid.UUID, writer http.ResponseWriter) error {
@@ -135,6 +136,12 @@ func checkinTrigger(ctx context.Context, id uuid.UUID, writer http.ResponseWrite
 		entity.DueToFire = now.Add(time.Duration(entity.HoursBetweenFire * int(time.Hour)))
 
 		_, err = store.Put(ctx, &key, &entity)
+
+		if err == nil {
+			sendEntity(writer, &entity)
+		}
+	} else if err == datastore.ErrNoSuchEntity {
+		err = &notFound
 	}
 
 	return err
@@ -154,18 +161,22 @@ func getTrigger(ctx context.Context, id uuid.UUID, writer http.ResponseWriter) e
 	err := store.Get(ctx, &datastore.Key{Kind: Kind, Name: id.String()}, &entity)
 
 	if err == nil {
-		writer.Header().Add("Content-Type", "application/json")
-		json.NewEncoder(writer).Encode(&entity)
+		sendEntity(writer, &entity)
 	}
 
 	return err
 }
 
+func sendEntity(writer http.ResponseWriter, entity *DeadMansTrigger) {
+	writer.Header().Add("Content-Type", "application/json")
+	_ = json.NewEncoder(writer).Encode(&entity)
+}
+
 func createTrigger(ctx context.Context, body io.ReadCloser, responseWriter http.ResponseWriter) error {
 	var input struct {
-		HoursBetweenFire int    `json:hoursBetweenFire`
-		FireURL          string `json:fireURL`
-		FirePayload      string `json:firePayload`
+		HoursBetweenFire int    `json:"hoursBetweenFire"`
+		FireURL          string `json:"fireURL"`
+		FirePayload      string `json:"firePayload"`
 	}
 
 	err := json.NewDecoder(body).Decode(&input)
