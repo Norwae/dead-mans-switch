@@ -13,6 +13,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -118,12 +119,12 @@ func HandleHTTP(rw http.ResponseWriter, rq *http.Request) {
 const Kind = "DMT"
 
 type DeadMansTrigger struct {
-	Id               string      `json:"id"`
+	Id               string      `json:"id" datastore:",noindex"`
 	DueToFire        time.Time   `json:"due"`
-	HoursBetweenFire int         `json:"hoursBetweenFire"`
-	Checkins         []time.Time `json:"checkins"`
-	FireURL          string      `json:"fireURL"`
-	FirePayload      string      `json:"firePayload"`
+	HoursBetweenFire int         `json:"hoursBetweenFire" datastore:",noindex"`
+	Checkins         []time.Time `json:"checkins" datastore:",noindex"`
+	FireURL          string      `json:"fireURL" datastore:",noindex"`
+	FirePayload      string      `json:"firePayload" datastore:",noindex"`
 }
 
 func checkinTrigger(ctx context.Context, id uuid.UUID, writer http.ResponseWriter) error {
@@ -213,17 +214,42 @@ func createTrigger(ctx context.Context, body io.ReadCloser, responseWriter http.
 type IgnoredParameter struct{}
 
 func ServeCron(ctx context.Context, ignore IgnoredParameter) error {
-	var err error
+	var (
+		err error
+		k   *datastore.Key
+		wg  sync.WaitGroup
+	)
 	query := datastore.NewQuery(Kind).Filter("DueToFire <= ", time.Now())
 	it := store.Run(ctx, query)
 	target := DeadMansTrigger{}
-	for _, err = it.Next(&target); err == nil; _, err = it.Next(&target) {
-		log.Printf("Firing %v", target)
+	for k, err = it.Next(&target); err == nil; _, err = it.Next(&target) {
+		log.Printf("Firing %s callback to %s (async)", target.Id, target.FireURL)
+		wg.Add(1)
+		go fireHttpCallback(ctx, target.FireURL, target.FirePayload, &wg)
+		err = store.Delete(ctx, k)
 	}
 
 	if err == iterator.Done {
 		err = nil
 	}
 
+	wg.Wait()
+
 	return err
+}
+
+func fireHttpCallback(ctx context.Context, requestUrl string, body string, group *sync.WaitGroup) {
+	var rsp *http.Response
+	rq, err := http.NewRequest("POST", requestUrl, strings.NewReader(body))
+	if err == nil {
+		if rsp, err = http.DefaultClient.Do(rq.WithContext(ctx)); err == nil {
+			log.Printf("Successfully invoked %s (status code: %d)", requestUrl, rsp.StatusCode)
+		}
+	}
+
+	if err != nil {
+		log.Printf("Failed to invoke %s, error: %v", requestUrl, err)
+	}
+
+	group.Done()
 }
