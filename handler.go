@@ -59,7 +59,6 @@ func HandleHTTP(rw http.ResponseWriter, rq *http.Request) {
 	var err error = &notFound
 	segments := strings.Split(rq.URL.Path, "/")
 	length := len(segments)
-	log.Printf("Split path into %d segments: %v", length, segments)
 	if length >= 2 && segments[1] == "triggers" {
 		switch length {
 		case 2:
@@ -79,10 +78,6 @@ func HandleHTTP(rw http.ResponseWriter, rq *http.Request) {
 
 					err = &StatusCodeError{http.StatusMethodNotAllowed, "The requested method is not available. Available methods: GET, DELETE"}
 				}
-			} else {
-				log.Printf("Could not parse %s into a valid UUID: %s", segments[2], e2)
-
-				// not found - not a valid UUID
 			}
 		case 4:
 			if id, e2 := uuid.FromString(segments[2]); e2 == nil && segments[3] == "checkin" {
@@ -91,12 +86,8 @@ func HandleHTTP(rw http.ResponseWriter, rq *http.Request) {
 				} else {
 					err = &StatusCodeError{http.StatusMethodNotAllowed, "The requested method is not available. Available methods: POST"}
 				}
-			} else {
-				log.Printf("Could not parse %s into a valid UUID: %s", segments[2], e2)
-				// not found - not a valid UUID
 			}
 		}
-
 	}
 
 	if err != nil {
